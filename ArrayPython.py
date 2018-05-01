@@ -4,6 +4,20 @@ import random
 import time
 import numpy as np
 import matplotlib.pyplot as plt
+import sys
+import json
+
+length = 8192
+padding = 200
+
+def process_args():
+    for arg in sys.argv:
+        if arg[:7] is 'length=':
+            length = int(arg[7:])
+            print('Detected argument length:', length)
+        if arg[:8] is 'padding=':
+            length = int(arg[8:])
+            print('Detected argument padding:', length)
 
 def butter_bandpass(lowcut, highcut, fs, order=5):
     nyq = 0.5 * fs
@@ -17,9 +31,9 @@ def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
     y = lfilter(b, a, data)
     return y
 
-def generate_signal(length = 8192, pad = 200, fs = 130000):
+def generate_signal():
     random_signal = np.array(np.random.normal(0, 1, length - (2 * pad)))
-    filtered_signal = butter_bandpass_filter(random_signal, 2000.0, 40000.0, fs)
+    filtered_signal = butter_bandpass_filter(random_signal, 2000.0, 40000.0, 130000)
     signal  = filtered_signal - np.mean(filtered_signal)
     signal[signal <= 0] = -1
     signal[signal > 0] = 1
@@ -63,70 +77,111 @@ def classify_system(s1, s2):
     pass
 
 if __name__ == "__main__":
-    with serial.Serial('/dev/ttyACM0', 19200) as ser:
 
-        # Clear any preexisting serial messages
-        print(ser.inWaiting(), ' bytes in waiting')
-        while ser.inWaiting() > 0:
-            ser.read(1)
+    process_args()
 
-        # Generate a new signal and send it to the teensy
-        sig, sig_binary = generate_signal(length=8192, pad=600)
-        send_signal(ser, sig_binary)
+    #####################
+    # Generate a Signal #
+    #####################
+    # If we pass in a signal file...
+    if signal_input:
+        # Open that signal file...
+        with open(signal_input) as f:
+            # And load that to memory...
+            data = json.load(f)
+            sig = data['sig']
+            sig_binary = data['sig_binary']
+    # Otherwise...
+    else:
+        # Generate a new signal
+        sig, sig_binary = generate_signal(length, padding)
 
-        # Read the output from the teensy
-        fs, out1, out2 = read_teensy(ser)
-        
-        # Discover the systems
-        sys1 = discover_system(sig, out1)
-        sys2 = discover_system(sig, out2)
+    #####################
+    # Get a data stream #
+    #####################
+    # If we did pass in data file...
+    if data_input:
+        # Open the data file...
+        with open(data_input, 'r') as f:
+            # And load it to memory...
+            data = json.load(f)
+            fs = data['fs']
+            out1 = data['out1']
+            out2 = data['out2']
+    # Otherwise, collect the data...
+    else:
+        # Open the serial port...
+        with serial.Serial('/dev/ttyACM0', 19200) as ser:
+            # Clear any preexisting serial messages...
+            print(ser.inWaiting(), ' bytes in waiting')
+            while ser.inWaiting() > 0:
+                ser.read(1)
+            # Send the signal...
+            send_signal(ser, sig_binary)
+            # Read the output from the teensy...
+            fs, out1, out2 = read_teensy(ser)
 
-        # Actually try to classify the systems
-        classify_system(sys1, sys2)
 
-        # Plot things for mic 1
-        fig = plt.figure(1)
-        ax = plt.subplot(321)
-        ax.set_title('Input Signal')
-        plt.plot(np.array(range(len(sig))) / fs, sig)
-        plt.xlabel('Time (s)')
-        plt.ylabel('Signal')
-        ax = plt.subplot(322)
-        ax.set_title('Input Signal FFT')
-        plt.plot(np.fft.rfftfreq(len(sig), d=1/fs), np.fft.rfft(sig))
-        plt.xlabel('Frequency (Hz)')
-        plt.ylabel('Power')
-        #plt.xlim([0, 750])
-        ax = plt.subplot(323)
-        ax.set_title('Mic Raw Signal')
-        plt.plot(np.array(range(len(out1))) / fs, (out1/(2**12) * 3.3))
-        plt.xlabel('Time (s)')
-        plt.ylabel('Voltage')
-        ax = plt.subplot(324)
-        ax.set_title('Mic Raw Signal FFT')
-        plt.plot(np.fft.rfftfreq(len(out1), d=1/fs), np.fft.rfft(out1/(2**12) * 3.3))
-        plt.xlabel('Frequency (Hz)')
-        plt.ylabel('Power')
-        # plt.xlim([30000, 60000])
-        ax = plt.subplot(325)
-        ax.set_title('System')
-        plt.plot(np.array(range(len(sys1))) / fs, sys1)
-        plt.xlabel('Lag (s)')
-        plt.ylabel('Response')
-        ax = plt.subplot(326)
-        # plt.xlim([30000, 60000])
-        ax.set_title('System FFT')
-        plt.plot(np.fft.rfftfreq(len(sys1), d=1/fs), np.fft.rfft(sys1))
-        plt.xlabel('Frequency (Hz)')
-        plt.ylabel('Gain')
-        plt.tight_layout()
+    if data_outpu
+                if not file_name:
+                    file_name = 'data.json'
+                with open(file_name, 'w') as f:
+                    json.dump({'sign': sig.tolist(),
+                               'sig_binary': sig_binary.tolist(),
+                               'fs': fs,
+                               'out1': out1.tolist(),
+                               'out2': out2.tolist()}, f)
 
-        plt.figure(2)
-        plt.plot((np.array(range(len(sig) * 2 - 1))-(len(sig))) / fs, np.correlate(sig, out1, 'full'))
-        plt.xlabel('Lag (s)')
-        plt.ylabel('Power')
-        plt.title('Input-Output Cross Correlation')
-        plt.tight_layout()
-        
-        plt.show()
-        
+    # Discover the systems
+    sys1 = discover_system(sig, out1)
+    sys2 = discover_system(sig, out2)
+
+    # Actually try to classify the systems
+    classify_system(sys1, sys2)
+
+    # Plot things for mic 1
+    fig = plt.figure(1)
+    ax = plt.subplot(321)
+    ax.set_title('Input Signal')
+    plt.plot(np.array(range(len(sig))) / fs, sig)
+    plt.xlabel('Time (s)')
+    plt.ylabel('Signal')
+    ax = plt.subplot(322)
+    ax.set_title('Input Signal FFT')
+    plt.plot(np.fft.rfftfreq(len(sig), d=1/fs), np.fft.rfft(sig))
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Power')
+    #plt.xlim([0, 750])
+    ax = plt.subplot(323)
+    ax.set_title('Mic Raw Signal')
+    plt.plot(np.array(range(len(out1))) / fs, (out1/(2**12) * 3.3))
+    plt.xlabel('Time (s)')
+    plt.ylabel('Voltage')
+    ax = plt.subplot(324)
+    ax.set_title('Mic Raw Signal FFT')
+    plt.plot(np.fft.rfftfreq(len(out1), d=1/fs), np.fft.rfft(out1/(2**12) * 3.3))
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Power')
+    # plt.xlim([30000, 60000])
+    ax = plt.subplot(325)
+    ax.set_title('System')
+    plt.plot(np.array(range(len(sys1))) / fs, sys1)
+    plt.xlabel('Lag (s)')
+    plt.ylabel('Response')
+    ax = plt.subplot(326)
+    # plt.xlim([30000, 60000])
+    ax.set_title('System FFT')
+    plt.plot(np.fft.rfftfreq(len(sys1), d=1/fs), np.fft.rfft(sys1))
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Gain')
+    plt.tight_layout()
+    
+    plt.figure(2)
+    plt.plot((np.array(range(len(sig) * 2 - 1))-(len(sig))) / fs, np.correlate(sig, out1, 'full'))
+    plt.xlabel('Lag (s)')
+    plt.ylabel('Power')
+    plt.title('Input-Output Cross Correlation')
+    plt.tight_layout()
+    
+    plt.show()
+    
