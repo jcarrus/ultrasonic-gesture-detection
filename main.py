@@ -41,7 +41,7 @@ def process_args():
             print('Detected argument serial_port: ', args['serial_port'])
         if arg[:13] == 'use_datafile=':
             args['use_datafile'] = arg[13:]
-            print('Detected argument use_datafile: ',args[' use_datafile'])
+            print('Detected argument use_datafile: ',args['use_datafile'])
         if arg[:12] == 'save_output=':
             args['save_output'] = arg[12:]
             print('Detected argument save_output: ', args['save_output'])
@@ -100,7 +100,15 @@ def generate_stochastic_signal(length, padding):
 
 # Generate a square signal of the length `length` padded with `padding` zeros
 def generate_square_signal(length, padding):
-    signal  = np.resize([1, -1], length - (2 * padding))
+    signal  = np.resize([1,1,1,1, -1,-1,-1,-1], length - (2 * padding))
+    padding = np.resize([0], padding)
+    signal = np.concatenate((padding, signal, padding))
+    signal_binary = np.array(signal > 0, dtype=int)
+    return (signal, signal_binary)
+
+# Generate a single square signal of the length `length` padded with `padding` zeros
+def generate_single_square_signal(length, padding):
+    signal  = np.resize([1], length - (2 * padding))
     padding = np.resize([0], padding)
     signal = np.concatenate((padding, signal, padding))
     signal_binary = np.array(signal > 0, dtype=int)
@@ -167,6 +175,9 @@ if __name__ == "__main__":
     elif args['signal_type'] == 'square':
         # Generate a square signal
         sig, sig_binary = generate_square_signal(args['length'], args['padding'])
+    elif args['signal_type'] == 'single_square':
+        # Generate a square signal
+        sig, sig_binary = generate_single_square_signal(args['length'], args['padding'])
     elif args['signal_type'] == 'stochastic':
         # Generate a new binary stochastic signal
         sig, sig_binary = generate_stochastic_signal(args['length'], args['padding'])
@@ -187,7 +198,7 @@ if __name__ == "__main__":
             else:
                 serial_port = ports[0]
         # Open the serial port...
-        with serial.Serial(serial_port, 19200) as ser:
+        with serial.Serial(args['serial_port'], 19200) as ser:
             # Clear any preexisting serial messages...
             p(debug, '%s bytes in waiting' % ser.inWaiting() )
             while ser.inWaiting() > 0:
@@ -199,24 +210,24 @@ if __name__ == "__main__":
     # Otherwise, read the datafile...
     else:
         # Open the data file...
-        with open(use_datafile, 'r') as f:
+        with open(args['use_datafile'], 'r') as f:
             # And load it to memory...
             data = json.load(f)
             fs = data['fs']
-            out1 = data['out1']
-            out2 = data['out2']
+            out1 = np.array(data['out1'])
+            out2 = np.array(data['out2'])
 
     #################
     # Save the Data #
     #################
     if not args['save_output'] == '':
-        with open(save_output, 'w') as f:
+        with open(args['save_output'], 'w') as f:
             json.dump({'sign': sig.tolist(),
                        'sig_binary': sig_binary.tolist(),
                        'fs': fs,
                        'out1': out1.tolist(),
                        'out2': out2.tolist()}, f)
-            print('Saved data to: ', save_output)
+            print('Saved data to: ', args['save_output'])
 
     ########################
     # Discover the systems #
@@ -269,6 +280,14 @@ if __name__ == "__main__":
     # Figure 2 is an input/output correlation plot
     plt.figure(2)
     plt.plot((np.array(range(len(sig) * 2 - 1))-(len(sig))) / fs, np.correlate(sig, out1, 'full'))
+    plt.xlabel('Lag (s)')
+    plt.ylabel('Power')
+    plt.title('Input-Output Cross Correlation')
+    plt.tight_layout()
+
+    # Figure 2 is an input/output correlation plot
+    plt.figure(3)
+    plt.plot((np.array(range(len(sig) * 2 - 1))-(len(sig))) / fs, np.correlate(np.concatenate((np.diff(sig), np.array([0]))), out1, 'full'))
     plt.xlabel('Lag (s)')
     plt.ylabel('Power')
     plt.title('Input-Output Cross Correlation')
