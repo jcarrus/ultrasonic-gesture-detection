@@ -14,6 +14,26 @@ def p(debug, object):
     if debug == 'true':
         print(object)
 
+help_string = """
+'ello dere m'ate. Hehz ya optshions fa diz'ere funkshun.
+
+usage:
+
+$ python main.py [help] [option1=option_text option2=option_text ...]
+
+options:
+
+help:                 print this useful help statement
+length=integer:       set the length of the generated signal
+padding=integer:      set the length of the padding on either side of the signal
+signal_input=dataset: use the signal previously generated and stored in a dataset
+signal_type=type:     generate a signal of a particular type
+serial_port=path:     use the serial port specified in path
+use_datafile=dataset: use the input and mic output data from a particular dataset
+save_output=dataset:  save the output of the script to a dataset with name dataset
+debug=boolean:        print lots of things to help debug this script
+"""
+
 # Process the command line arguments and return an args dictionary
 def process_args():
     args = {'length': 8192,
@@ -25,6 +45,9 @@ def process_args():
             'save_output': '',
             'debug': ''}
     for arg in sys.argv:
+        if arg == 'help':
+            print(help_string)
+            exit()
         if arg[:7] == 'length=':
             args['length'] = int(arg[7:])
             print('Detected argument length: ', args['length'])
