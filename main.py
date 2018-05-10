@@ -1,5 +1,6 @@
 import serial
 from scipy.signal import butter, lfilter
+from scipy.linalg import toeplitz
 import random
 import time
 import numpy as np
@@ -11,7 +12,7 @@ import os
 
 # A tool to help print things
 def p(debug, object):
-    if debug == 'true':
+    if debug == True:
         print(object)
 
 help_string = """
@@ -31,7 +32,8 @@ signal_type=type:     generate a signal of a particular type
 serial_port=path:     use the serial port specified in path
 use_datafile=dataset: use the input and mic output data from a particular dataset
 save_output=dataset:  save the output of the script to a dataset with name dataset
-debug=boolean:        print lots of things to help debug this script
+use_toeplitz:         use the toeplitz form of deconvolution
+debug:                print lots of things to help debug this script
 """
 
 # Process the command line arguments and return an args dictionary
@@ -43,7 +45,8 @@ def process_args():
             'serial_port': '',
             'use_datafile': '',
             'save_output': '',
-            'debug': ''}
+            'use_toeplitz': False,
+            'debug': False}
     for arg in sys.argv:
         if arg == 'help':
             print(help_string)
@@ -69,8 +72,11 @@ def process_args():
         if arg[:12] == 'save_output=':
             args['save_output'] = arg[12:]
             print('Detected argument save_output: ', args['save_output'])
-        if arg[:6] == 'debug=':
-            args['debug'] = arg[6:]
+        if arg == 'use_toeplitz':
+            args['use_toeplitz'] = True
+            print('Detected argument use_toeplitz')
+        if arg[:6] == 'debug':
+            args['debug'] = True
             print('Detected argument debug: ', args['debug'])
     return args
 
@@ -173,13 +179,36 @@ def read_teensy(ser):
     out2 = np.subtract(out2, np.mean(out2))
     return (sample_freq, out1, out2)
 
-# Discover the system from an input `i` and output `o`
+# Discover the system from an input `i` and output `o` using a traditional FFT method
 def discover_system(i, o):
     padding = np.resize([0], len(i))
     i_padded = np.concatenate((padding, i, padding))
     o_padded = np.concatenate((padding, o, padding))
     ffts = np.divide(np.fft.fft(o_padded), np.fft.fft(i_padded))
     sys = np.real(np.fft.ifft(ffts[:ffts.size]))
+    return sys
+
+# Discover the system from an input `i` and output `o` using a toeplitz form
+def discover_system_toeplitz(i, o, fs):
+    mean_i = np.mean(i)
+    mean_o = np.mean(o)
+    num_samples = len(i)
+    print('num_samples: ', num_samples)
+    max_lag = num_samples // 10
+    print('max_lag: ', max_lag)
+    Cxx = np.resize([0], max_lag)
+    Cxy = np.resize([0], max_lag)
+    for j in range(max_lag):
+        Cxx[j] = np.sum([(i[k-j] - mean_i) * (i[k] - mean_i) for k in range(j, num_samples)])
+        Cxy[j] = np.sum([(i[k-j] - mean_i) * (o[k] - mean_o) for k in range(j, num_samples)])
+    T = toeplitz(Cxx)
+    print('Cxx Matrix:')
+    print(Cxx)
+    print('T Matrix:')
+    print(T)
+    sys = fs * np.matmul(np.linalg.inv(T), Cxy)
+    print('sys:')
+    print(sys)
     return sys
 
 # Classify the identified systems as a gesture state
@@ -197,28 +226,30 @@ if __name__ == "__main__":
     #####################
     # Generate a Signal #
     #####################
-    # If we pass in a signal file...
-    if not args['signal_input'] == '':
-        # Open that signal file...
-        filename = './data/%s.datafile' % args['signal_input']
-        with open(filename) as f:
-            # And load that to memory...
-            data = json.load(f)
-            sig = data['sig']
-            sig_binary = data['sig_binary']
-    # Otherwise...
-    elif args['signal_type'] == 'square':
-        # Generate a square signal
-        sig, sig_binary = generate_square_signal(args['length'], args['padding'])
-    elif args['signal_type'] == 'single_square':
-        # Generate a square signal
-        sig, sig_binary = generate_single_square_signal(args['length'], args['padding'])
-    elif args['signal_type'] == 'stochastic':
-        # Generate a new binary stochastic signal
-        sig, sig_binary = generate_stochastic_signal(args['length'], args['padding'])
-    else:
-        print('Signal type not specified, defaulting to stochastic')
-        sig, sig_binary = generate_stochastic_signal(args['length'], args['padding'])
+    # If we don't pass in a datafile...
+    if args['use_datafile'] == '':
+    	# If we pass in a signal file...
+    	if not args['signal_input'] == '':
+    	    # Open that signal file...
+    	    filename = './data/%s.datafile' % args['signal_input']
+    	    with open(filename) as f:
+    	        # And load that to memory...
+    	        data = json.load(f)
+    	        sig = data['sig']
+    	        sig_binary = data['sig_binary']
+    	# Otherwise...
+    	elif args['signal_type'] == 'square':
+    	    # Generate a square signal
+    	    sig, sig_binary = generate_square_signal(args['length'], args['padding'])
+    	elif args['signal_type'] == 'single_square':
+    	    # Generate a square signal
+    	    sig, sig_binary = generate_single_square_signal(args['length'], args['padding'])
+    	elif args['signal_type'] == 'stochastic':
+    	    # Generate a new binary stochastic signal
+    	    sig, sig_binary = generate_stochastic_signal(args['length'], args['padding'])
+    	else:
+    	    print('Signal type not specified, defaulting to stochastic')
+    	    sig, sig_binary = generate_stochastic_signal(args['length'], args['padding'])
     
     #####################
     # Get a data stream #
@@ -249,9 +280,10 @@ if __name__ == "__main__":
         with open(filename, 'r') as f:
             # And load it to memory...
             data = json.load(f)
-            fs = data['fs']
+            fs   = data['fs']
             out1 = np.array(data['out1'])
             out2 = np.array(data['out2'])
+            sig  = np.array(data['sig'])
 
     #################
     # Save the Data #
@@ -270,8 +302,18 @@ if __name__ == "__main__":
     ########################
     # Discover the systems #
     ########################
-    sys1 = discover_system(sig, out1)
-    sys2 = discover_system(sig, out2)
+
+    if args['use_toeplitz'] == True:
+        sys1 = discover_system_toeplitz(sig, out1, fs)
+        p(debug, sys1)
+        sys2 = discover_system_toeplitz(sig, out2, fs)
+        p(debug, sys2)
+    else:
+        sys1 = discover_system(sig, out1)
+        p(debug, sys1)
+        sys2 = discover_system(sig, out2)
+        p(debug, sys2)
+        
 
     ####################################
     # Classify the system as a gesture #
