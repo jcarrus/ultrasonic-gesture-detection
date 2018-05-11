@@ -1,6 +1,6 @@
 import serial
 from scipy.signal import butter, lfilter
-from scipy.linalg import toeplitz
+from scipy.linalg import toeplitz, solve_toeplitz
 import random
 import time
 import numpy as np
@@ -28,11 +28,12 @@ help:                 print this useful help statement
 length=integer:       set the length of the generated signal
 padding=integer:      set the length of the padding on either side of the signal
 signal_input=dataset: use the signal previously generated and stored in a dataset
-signal_type=type:     generate a signal of a particular type
+signal_type=type:     generate a signal of a particular type [simple_stochasic]
 serial_port=path:     use the serial port specified in path
 use_datafile=dataset: use the input and mic output data from a particular dataset
 save_output=dataset:  save the output of the script to a dataset with name dataset
 use_toeplitz:         use the toeplitz form of deconvolution
+filter_mic:           run the mic output through a bandpass filter to remove some noise
 debug:                print lots of things to help debug this script
 """
 
@@ -45,7 +46,9 @@ def process_args():
             'serial_port': '',
             'use_datafile': '',
             'save_output': '',
+            'num_repeats': 1,
             'use_toeplitz': False,
+            'filter_mic': False,
             'debug': False}
     for arg in sys.argv:
         if arg == 'help':
@@ -72,9 +75,15 @@ def process_args():
         if arg[:12] == 'save_output=':
             args['save_output'] = arg[12:]
             print('Detected argument save_output: ', args['save_output'])
+        if arg[:12] == 'num_repeats=':
+            args['num_repeats'] = int(arg[12:])
+            print('Detected argument num_repeats: ', args['num_repeats'])
         if arg == 'use_toeplitz':
             args['use_toeplitz'] = True
             print('Detected argument use_toeplitz')
+        if arg == 'filter_mic':
+            args['filter_mic'] = True
+            print('Detected argument filter_mic')
         if arg[:6] == 'debug':
             args['debug'] = True
             print('Detected argument debug: ', args['debug'])
@@ -105,7 +114,7 @@ def list_serial_ports():
             s.close()
             result.append(port)
         except (OSError, serial.SerialException):
-            print(sys.exc_info()[0])
+            pass
     return result
 
 # A helper function for the filter below
@@ -123,61 +132,66 @@ def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
     return y
 
 # Generate a binary stochastic signal of the length `length`
-def generate_stochastic_signal(length, padding):
+def generate_stochastic_signal(length):
     random_signal = np.array(np.random.normal(0, 1, length - (2 * padding)))
-    filtered_signal = butter_bandpass_filter(random_signal, 2000.0, 40000.0, 130000)
-    signal  = filtered_signal - np.mean(filtered_signal)
+    signal  = random_signal - np.mean(random_signal)
     signal[signal <= 0] = -1
     signal[signal > 0] = 1
     padding = np.array([0 for x in range(padding)])
     signal = np.concatenate((padding, signal, padding))
-    signal_binary = np.array(signal > 0, dtype=int)
-    return (signal, signal_binary)
+    return signal
+
+# Generate a binary stochastic signal of the length `length`
+def generate_simple_stochastic_signal(length):
+    signal = np.resize([1, 0], length)
+    for i in range(1, length):
+        if random.random() > 0.9:
+            signal[i] = -1 * signal[i-1]
+        else:
+            signal[i] = signal[i-1]
+    return signal.tolist()
 
 # Generate a square signal of the length `length` padded with `padding` zeros
 def generate_square_signal(length, padding):
     signal  = np.resize([1,1,1,1, -1,-1,-1,-1], length - (2 * padding))
     padding = np.resize([0], padding)
     signal = np.concatenate((padding, signal, padding))
-    signal_binary = np.array(signal > 0, dtype=int)
-    return (signal, signal_binary)
+    return signal
+
+# Generate a sinusoid signal
+def generate_sinusoid_signal(length):
+    freq = 10000
+    signal = np.array([np.sin(x * 2 * np.pi / (140000 / freq)) for x in range(length)])
+    return signal
 
 # Generate a single square signal of the length `length` padded with `padding` zeros
 def generate_single_square_signal(length, padding):
     signal  = np.resize([1], length - (2 * padding))
     padding = np.resize([0], padding)
     signal = np.concatenate((padding, signal, padding))
-    signal_binary = np.array(signal > 0, dtype=int)
-    return (signal, signal_binary)
+    return signal
 
 # Send the `signal` over the serial `ser`
 def send_signal(ser, signal):
-    print('Signal: ', signal)
-    print('Signal Length: ', len(signal))
-    signal_length = len(signal).to_bytes(2, byteorder='big')
-    print('Sending as signal_length: ', signal_length)
-    ser.write(signal_length)
-    ser.write(np.packbits(signal).tobytes())
+    # Scale the signal for the teensy
+    s = np.array(signal) - np.mean(signal)
+    s *= (255.0 / 2) / abs(s).max()
+    s += (255.0 / 2)
+    ser.write(bytes([int(x) for x in s]))
     ser.flush()
 
 # Read in a teensy datastring from serial `ser`
-def read_teensy(ser):
+def read_teensy(ser, length):
     num_bytes = 2
-    num_samplers = 2
-    num_samples = int.from_bytes(ser.read(2), byteorder='big')
-    print('Took ', num_samples, ' samples')
-
-    sample_period = int.from_bytes(ser.read(4), byteorder='big')/1000000
-    sample_freq = num_samples / sample_period
-    print('Sampling Freq: ', sample_freq)
-
-    raw_output = ser.read(num_samples * num_bytes * num_samplers)
+    num_samplers = 3
+    raw_output = ser.read(length * num_bytes * num_samplers)
     output = [(raw_output[x] << 8) + raw_output[x+1] for x in range(0, len(raw_output), 2)]
-    out1 = np.array(output[:len(output)//2])
-    out1 = np.subtract(out1, np.mean(out1))
-    out2 = np.array(output[len(output)//2:])
-    out2 = np.subtract(out2, np.mean(out2))
-    return (sample_freq, out1, out2)
+    times = np.array(output[:len(output)//3])
+    out1 = np.array(output[len(output)//3:2*(len(output)//3)])
+    out1 = out1 - np.mean(out1)
+    out2 = np.array(output[-(len(output)//3):])
+    out2 = out2 - np.mean(out2)
+    return (times.tolist(), out1.tolist(), out2.tolist())
 
 # Discover the system from an input `i` and output `o` using a traditional FFT method
 def discover_system(i, o):
@@ -193,26 +207,21 @@ def discover_system_toeplitz(i, o, fs):
     mean_i = np.mean(i)
     mean_o = np.mean(o)
     num_samples = len(i)
-    print('num_samples: ', num_samples)
     max_lag = num_samples // 10
-    print('max_lag: ', max_lag)
     Cxx = np.resize([0], max_lag)
     Cxy = np.resize([0], max_lag)
     for j in range(max_lag):
         Cxx[j] = np.sum([(i[k-j] - mean_i) * (i[k] - mean_i) for k in range(j, num_samples)])
         Cxy[j] = np.sum([(i[k-j] - mean_i) * (o[k] - mean_o) for k in range(j, num_samples)])
-    T = toeplitz(Cxx)
-    print('Cxx Matrix:')
-    print(Cxx)
-    print('T Matrix:')
-    print(T)
-    sys = fs * np.matmul(np.linalg.inv(T), Cxy)
-    print('sys:')
-    print(sys)
+
+    col = np.resize([0], len(Cxx))
+    col[0] = Cxx[0]
+    
+    sys = fs * solve_toeplitz((col, Cxx), Cxy) / num_samples
     return sys
 
 # Classify the identified systems as a gesture state
-def classify_system(s1, s2):
+def classify_system(s1):
     pass
 
 ## The main function
@@ -221,6 +230,7 @@ if __name__ == "__main__":
     # Process the command line arguments
     args = process_args()
     debug = args['debug']
+    num_repeats = args['num_repeats']
     p(debug, args)
     
     #####################
@@ -228,29 +238,38 @@ if __name__ == "__main__":
     #####################
     # If we don't pass in a datafile...
     if args['use_datafile'] == '':
-    	# If we pass in a signal file...
-    	if not args['signal_input'] == '':
-    	    # Open that signal file...
-    	    filename = './data/%s.datafile' % args['signal_input']
-    	    with open(filename) as f:
-    	        # And load that to memory...
-    	        data = json.load(f)
-    	        sig = data['sig']
-    	        sig_binary = data['sig_binary']
-    	# Otherwise...
-    	elif args['signal_type'] == 'square':
-    	    # Generate a square signal
-    	    sig, sig_binary = generate_square_signal(args['length'], args['padding'])
-    	elif args['signal_type'] == 'single_square':
-    	    # Generate a square signal
-    	    sig, sig_binary = generate_single_square_signal(args['length'], args['padding'])
-    	elif args['signal_type'] == 'stochastic':
-    	    # Generate a new binary stochastic signal
-    	    sig, sig_binary = generate_stochastic_signal(args['length'], args['padding'])
-    	else:
-    	    print('Signal type not specified, defaulting to stochastic')
-    	    sig, sig_binary = generate_stochastic_signal(args['length'], args['padding'])
-    
+        # If we pass in a signal file...
+        if not args['signal_input'] == '':
+            # Open that signal file...
+            filename = './data/%s/%s.datafile' % (args['use_datafile'], args['use_datafile'])
+            with open(filename) as f:
+                # And load that to memory...
+                data = json.load(f)
+                sig = data['sig']
+        # Otherwise...
+        else:
+            sig = []
+            if args['signal_type'] == 'square':
+                # Generate a square signal
+                sig = generate_square_signal(args['length'], args['padding'])
+            elif args['signal_type'] == 'single_square':
+                # Generate a square signal
+                sig = generate_single_square_signal(args['length'], args['padding'])
+            elif args['signal_type'] == 'stochastic':
+                # Generate a new binary stochastic signal
+                sig = generate_stochastic_signal(args['length'])
+            elif args['signal_type'] == 'simple_stochastic':
+                # Generate a new binary stochastic signal
+                for i in range(num_repeats):
+                    sig.append(generate_simple_stochastic_signal(args['length']))
+            elif args['signal_type'] == 'sinusoid':
+                # Generate a new sinusoid
+                sig = generate_sinusoid_signal(args['length'])
+            else:
+                print('Signal type not specified, defaulting to simple stochastic')
+                for i in range(num_repeats):
+                    sig.append(generate_simple_stochastic_signal(args['length']))
+
     #####################
     # Get a data stream #
     #####################
@@ -270,21 +289,66 @@ if __name__ == "__main__":
             while ser.inWaiting() > 0:
                 ser.read(1)
             # Send the signal...
-            send_signal(ser, sig_binary)
-            # Read the output from the teensy...
-            fs, out1, out2 = read_teensy(ser)
+            times = []
+            out1 = []
+            out2 = []
+            for i in range(num_repeats):
+                send_signal(ser, sig[i])
+                # Read the output from the teensy...
+                t, o1, o2 = read_teensy(ser, args['length'])
+                times.append(t)
+                out1.append(o1)
+                out2.append(o2)
     # Otherwise, read the datafile...
     else:
         # Open the data file...
         filename = './data/%s/%s.datafile' % (args['use_datafile'], args['use_datafile'])
         with open(filename, 'r') as f:
             # And load it to memory...
-            data = json.load(f)
-            fs   = data['fs']
-            out1 = np.array(data['out1'])
-            out2 = np.array(data['out2'])
-            sig  = np.array(data['sig'])
+            data  = json.load(f)
+            times = data['times']
+            out1  = data['out1']
+            out2  = data['out2']
+            sig   = data['sig']
 
+
+    ########################
+    # Discover the systems #
+    ########################
+
+    sys1 = []
+    sys2 = []
+    
+    for i in range(num_repeats):
+        fs = 1000000 / (np.mean(np.diff(times[i])))
+        s = sig[i]
+        o1 = out1[i]
+        o2 = out2[i]
+        
+        print('Iteration: ', i, ' with sampling frequency of: ', fs)
+
+        if args['filter_mic'] == True:
+            o1 = butter_bandpass_filter(o1, 30000, 50000, fs)
+            o2 = butter_bandpass_filter(o2, 30000, 50000, fs)
+        
+        if args['use_toeplitz'] == True:
+            sys1.append(discover_system_toeplitz(sig[i], out1[i], fs))
+        else:
+            sys1.append(discover_system(sig[i], out1[i]))
+            p(debug, sys1)
+
+    times = np.array(times[0])
+    sig = np.array(sig[0])
+    out1 = butter_bandpass_filter(out1[0], 30000, 50000, fs)
+    out2 = np.array(out1)
+    sys1 = np.mean(sys1, axis=0)
+    sys2 = np.array(sys1)
+
+    ####################################
+    # Classify the system as a gesture #
+    ####################################
+    classify_system(sys1)
+    
     #################
     # Save the Data #
     #################
@@ -293,32 +357,12 @@ if __name__ == "__main__":
         ensure_dir(filename)
         with open(filename, 'w') as f:
             json.dump({'sig': sig.tolist(),
-                       'sig_binary': sig_binary.tolist(),
-                       'fs': fs,
+                       'times': times.tolist(),
                        'out1': out1.tolist(),
-                       'out2': out2.tolist()}, f)
+                       'out2': out2.tolist(),
+                       'sys1': sys1.tolist(),
+                       'sys2': sys2.tolist()}, f)
             print('Saved data to: ', filename)
-
-    ########################
-    # Discover the systems #
-    ########################
-
-    if args['use_toeplitz'] == True:
-        sys1 = discover_system_toeplitz(sig, out1, fs)
-        p(debug, sys1)
-        sys2 = discover_system_toeplitz(sig, out2, fs)
-        p(debug, sys2)
-    else:
-        sys1 = discover_system(sig, out1)
-        p(debug, sys1)
-        sys2 = discover_system(sig, out2)
-        p(debug, sys2)
-        
-
-    ####################################
-    # Classify the system as a gesture #
-    ####################################
-    classify_system(sys1, sys2)
 
     ###############
     # Plot things #
@@ -327,7 +371,7 @@ if __name__ == "__main__":
     fig = plt.figure(1)
     ax = plt.subplot(321)
     ax.set_title('Input Signal')
-    plt.plot(np.array(range(len(sig))) / fs, sig)
+    plt.plot(times/1000000, sig)
     plt.xlabel('Time (s)')
     plt.ylabel('Signal')
     ax = plt.subplot(322)
@@ -337,7 +381,7 @@ if __name__ == "__main__":
     plt.ylabel('Power')
     ax = plt.subplot(323)
     ax.set_title('Mic Raw Signal')
-    plt.plot(np.array(range(len(out1))) / fs, (out1/(2**12) * 3.3))
+    plt.plot(times / 1000000, (out1/(2**12) * 3.3))
     plt.xlabel('Time (s)')
     plt.ylabel('Voltage')
     ax = plt.subplot(324)
@@ -347,12 +391,12 @@ if __name__ == "__main__":
     plt.ylabel('Power')
     ax = plt.subplot(325)
     ax.set_title('System')
-    plt.plot(np.array(range(len(sys1))) / fs, sys1)
+    plt.plot(np.array(range(len(sys1))) / fs, np.abs(sys1))
     plt.xlabel('Lag (s)')
     plt.ylabel('Response')
     ax = plt.subplot(326)
     ax.set_title('System FFT')
-    plt.plot(np.fft.rfftfreq(len(sys1), d=1/fs), np.fft.rfft(sys1))
+    plt.loglog(np.fft.rfftfreq(len(sys1), d=1/fs), abs(np.fft.rfft(sys1)))
     plt.xlabel('Frequency (Hz)')
     plt.ylabel('Gain')
     plt.tight_layout()
