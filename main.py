@@ -1,5 +1,5 @@
 import serial
-from scipy.signal import butter, lfilter
+from scipy.signal import butter, lfilter, hilbert
 from scipy.linalg import toeplitz, solve_toeplitz
 import random
 import time
@@ -25,8 +25,7 @@ $ python main.py [help] [option1=option_text option2=option_text ...]
 options:
 
 help:                 print this useful help statement
-length=integer:       set the length of the generated signal
-padding=integer:      set the length of the padding on either side of the signal
+realtime:             do things continuously
 signal_input=dataset: use the signal previously generated and stored in a dataset
 signal_type=type:     generate a signal of a particular type [simple_stochasic]
 serial_port=path:     use the serial port specified in path
@@ -49,6 +48,7 @@ def process_args():
             'num_repeats': 1,
             'use_toeplitz': False,
             'filter_mic': False,
+            'realtime': False,
             'debug': False}
     for arg in sys.argv:
         if arg == 'help':
@@ -84,6 +84,9 @@ def process_args():
         if arg == 'filter_mic':
             args['filter_mic'] = True
             print('Detected argument filter_mic')
+        if arg == 'realtime':
+            args['realtime'] = True
+            print('Detected argument realtime')
         if arg[:6] == 'debug':
             args['debug'] = True
             print('Detected argument debug: ', args['debug'])
@@ -128,6 +131,17 @@ def butter_bandpass(lowcut, highcut, fs, order=5):
 # Filter data with a bandpass filter
 def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
     b, a = butter_bandpass(lowcut, highcut, fs, order=order)
+    y = lfilter(b, a, data)
+    return y
+
+def butter_lowpass(cutoff, fs, order=5):
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    return b, a
+
+def butter_lowpass_filter(data, cutoff, fs, order=5):
+    b, a = butter_lowpass(cutoff, fs, order=order)
     y = lfilter(b, a, data)
     return y
 
@@ -193,13 +207,42 @@ def read_teensy(ser, length):
     out2 = out2 - np.mean(out2)
     return (times.tolist(), out1.tolist(), out2.tolist())
 
+def moving_abs_average(data, span):
+    d = np.array(abs(data))
+    for i in range(span, len(data) - span):
+        d[i] = np.sum(data[i-span : i + span+1])
+    return d
+
 # Discover the system from an input `i` and output `o` using a traditional FFT method
 def discover_system(i, o):
     padding = np.resize([0], len(i))
-    i_padded = np.concatenate((padding, i, padding))
-    o_padded = np.concatenate((padding, o, padding))
-    ffts = np.divide(np.fft.fft(o_padded), np.fft.fft(i_padded))
-    sys = np.real(np.fft.ifft(ffts[:ffts.size]))
+    i_padded = np.concatenate((i, padding))
+    if not np.all(np.isfinite(i_padded)):
+        print('i_padded not finite')
+        print(i_padded.tolist())
+    o_padded = np.concatenate((o, padding))
+    if not np.all(np.isfinite(o_padded)):
+        print('o_padded not finite')
+        print(o_padded.tolist())
+    i_fft = np.fft.fft(i_padded)
+    if not np.all(np.isfinite(i_fft)):
+        print('i_fft not finite')
+        print(i_fft.tolist())
+    np.place(i_fft, i_fft == 0, [.01])
+    o_fft = np.fft.fft(o_padded)
+    if not np.all(np.isfinite(o_fft)):
+        print('o_fft not finite')
+        print(o_fft.tolist())
+    ffts = np.divide(o_fft, i_fft)
+    if not np.all(np.isfinite(ffts)):
+        print('ffts not finite with val')
+        print(np.extract(np.invert(np.isfinite(ffts)), i_fft))
+        print('at freq')
+        print(np.extract(np.invert(np.isfinite(ffts)), np.fft.rfftfreq(len(o_padded), d=1/130000)))
+    sys = np.fft.irfft(ffts)
+    if not np.all(np.isfinite(sys)):
+        print('sys not finite')
+        #print(ffts.tolist())
     return sys
 
 # Discover the system from an input `i` and output `o` using a toeplitz form
@@ -218,17 +261,130 @@ def discover_system_toeplitz(i, o, fs):
     col[0] = Cxx[0]
     
     sys = fs * solve_toeplitz((col, Cxx), Cxy) / num_samples
+    sys = moving_abs_average(sys, 0)
     return sys
 
 # Classify the identified systems as a gesture state
 def classify_system(s1):
     pass
 
-## The main function
-if __name__ == "__main__":
+def update_plot(times, sig, out1, sys1, out2, sys2, fig, l0, l1, l2, l3, l4, l5):
+    ###############
+    # Plot things #
+    ###############
+    fs = 1000000 / (np.mean(np.diff(times)))
+    # figure 1 shows how to discover the system for mic 1
+    l0.set_xdata(times/1000000)
+    l0.set_ydata(sig)
+    l1.set_xdata(np.fft.rfftfreq(len(sig), d=1/fs))
+    l1.set_ydata(np.fft.rfft(sig))
+    l2.set_xdata(times / 1000000)
+    l2.set_ydata((out1/(2**12) * 3.3))
+    l3.set_xdata(np.fft.rfftfreq(len(out1), d=1/fs))
+    l3.set_ydata(np.fft.rfft(out1/(2**12) * 3.3))
+    l4.set_xdata(np.array(range(len(sys1))) / fs)
+    l4.set_ydata(sys1)
+    l5.set_xdata(np.fft.rfftfreq(len(sys1), d=1/fs))
+    l5.set_ydata(abs(np.fft.rfft(sys1)))
+    fig.canvas.draw()
+    
+    # # Figure 2 is an input/output correlation plot
+    # plt.figure(2)
+    # plt.plot((np.array(range(len(sig) * 2 - 1))-(len(sig))) / fs, np.correlate(out1, sig, 'full'))
+    # plt.xlabel('Lag (s)')
+    # plt.ylabel('Power')
+    # plt.title('Input-Output Cross Correlation')
+    # plt.tight_layout()
+    # if not args['save_output'] == '':
+    #     plt.savefig('./data/%s/%s - 2.png' % (args['save_output'], args['save_output']), dpi=600, format='png')
 
-    # Process the command line arguments
-    args = process_args()
+    # # Figure 3 is an input/output correlation plot
+    # plt.figure(3)
+    # plt.plot((np.array(range(len(sig) * 2 - 1))-(len(sig))) / fs, np.correlate(out1, np.concatenate((np.diff(sig), np.array([0]))), 'full'))
+    # plt.xlabel('Lag (s)')
+    # plt.ylabel('Power')
+    # plt.title('Input-Output Cross Correlation')
+    # plt.tight_layout()
+    # if not args['save_output'] == '':
+    #     plt.savefig('./data/%s/%s - 3.png' % (args['save_output'], args['save_output']), dpi=600, format='png')
+    # plt.xlim(0, 0.004)
+    # if not args['save_output'] == '':
+    #     plt.savefig('./data/%s/%s - 4.png' % (args['save_output'], args['save_output']), dpi=600, format='png')
+
+    # return (l0, l1, l2, l3, l4, l5)
+
+
+def plot(times, sig, out1, sys1, out2, sys2):
+    ###############
+    # Plot things #
+    ###############
+    fs = 1000000 / (np.mean(np.diff(times)))
+    # figure 1 shows how to discover the system for mic 1
+    fig = plt.figure(1, figsize=(8,8))
+    ax = plt.subplot(321)
+    ax.set_title('Input Signal')
+    l0, = plt.plot(times/1000000, sig)
+    plt.xlabel('Time (s)')
+    plt.ylabel('Signal')
+    ax = plt.subplot(322)
+    ax.set_title('Input Signal FFT')
+    l1, = plt.plot(np.fft.rfftfreq(len(sig), d=1/fs), np.fft.rfft(sig))
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Power')
+    ax = plt.subplot(323)
+    ax.set_title('Mic Raw Signal')
+    l2, = plt.plot(times / 1000000, (out1/(2**12) * 3.3))
+    plt.xlabel('Time (s)')
+    plt.ylabel('Voltage')
+    plt.ylim(-2, 2)
+    ax = plt.subplot(324)
+    ax.set_title('Mic Raw Signal FFT')
+    l3, = plt.plot(np.fft.rfftfreq(len(out1), d=1/fs), np.fft.rfft(out1/(2**12) * 3.3))
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Power')
+    ax = plt.subplot(325)
+    ax.set_title('System')
+    l4, = plt.plot(np.array(range(len(sys1))) / fs, sys1)
+    plt.xlabel('Lag (s)')
+    plt.ylabel('Response')
+    plt.xlim(0, .005)
+    plt.ylim(-300, 300)
+    ax = plt.subplot(326)
+    ax.set_title('System FFT')
+    l5, = plt.loglog(np.fft.rfftfreq(len(sys1), d=1/fs), abs(np.fft.rfft(sys1)))
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Gain')
+    plt.xlim(500, 130000)
+    plt.ylim(10, 100000)
+    plt.tight_layout()
+    fig.canvas.draw()
+    if not args['save_output'] == '':
+        plt.savefig('./data/%s/%s - 1.png' % (args['save_output'], args['save_output']), dpi=600, format='png')
+    
+    # Figure 2 is an input/output correlation plot
+    plt.figure(2)
+    plt.plot((np.array(range(len(sig) * 2 - 1))-(len(sig))) / fs, np.correlate(out1, sig, 'full'))
+    plt.xlabel('Lag (s)')
+    plt.ylabel('Power')
+    plt.title('Input-Output Cross Correlation')
+    plt.tight_layout()
+    if not args['save_output'] == '':
+        plt.savefig('./data/%s/%s - 2.png' % (args['save_output'], args['save_output']), dpi=600, format='png')
+
+    # Figure 3 is an input/output correlation plot
+    plt.figure(3)
+    plt.plot((np.array(range(len(sig) * 2 - 1))-(len(sig))) / fs, np.correlate(out1, np.concatenate((np.diff(sig), np.array([0]))), 'full'))
+    plt.xlabel('Lag (s)')
+    plt.ylabel('Power')
+    plt.title('Input-Output Cross Correlation')
+    plt.tight_layout()
+    plt.xlim(0, 0.004)
+    if not args['save_output'] == '':
+        plt.savefig('./data/%s/%s - 4.png' % (args['save_output'], args['save_output']), dpi=600, format='png')
+
+    return fig, (l0, l1, l2, l3, l4, l5)
+
+def run_system(args):
     debug = args['debug']
     num_repeats = args['num_repeats']
     p(debug, args)
@@ -328,7 +484,8 @@ if __name__ == "__main__":
         print('Iteration: ', i, ' with sampling frequency of: ', fs)
 
         if args['filter_mic'] == True:
-            o1 = butter_bandpass_filter(o1, 30000, 50000, fs)
+            s  = np.concatenate(([0], np.abs(np.diff(s))))
+            o1 = butter_lowpass_filter(o1, 50000, fs)
             o2 = butter_bandpass_filter(o2, 30000, 50000, fs)
         
         if args['use_toeplitz'] == True:
@@ -339,15 +496,10 @@ if __name__ == "__main__":
 
     times = np.array(times[0])
     sig = np.array(sig[0])
-    out1 = butter_bandpass_filter(out1[0], 30000, 50000, fs)
-    out2 = np.array(out1)
+    out1 = np.array(o1)
+    out2 = np.array(o2)
     sys1 = np.mean(sys1, axis=0)
     sys2 = np.array(sys1)
-
-    ####################################
-    # Classify the system as a gesture #
-    ####################################
-    classify_system(sys1)
     
     #################
     # Save the Data #
@@ -364,68 +516,27 @@ if __name__ == "__main__":
                        'sys2': sys2.tolist()}, f)
             print('Saved data to: ', filename)
 
-    ###############
-    # Plot things #
-    ###############
-    # figure 1 shows how to discover the system for mic 1
-    fig = plt.figure(1)
-    ax = plt.subplot(321)
-    ax.set_title('Input Signal')
-    plt.plot(times/1000000, sig)
-    plt.xlabel('Time (s)')
-    plt.ylabel('Signal')
-    ax = plt.subplot(322)
-    ax.set_title('Input Signal FFT')
-    plt.plot(np.fft.rfftfreq(len(sig), d=1/fs), np.fft.rfft(sig))
-    plt.xlabel('Frequency (Hz)')
-    plt.ylabel('Power')
-    ax = plt.subplot(323)
-    ax.set_title('Mic Raw Signal')
-    plt.plot(times / 1000000, (out1/(2**12) * 3.3))
-    plt.xlabel('Time (s)')
-    plt.ylabel('Voltage')
-    ax = plt.subplot(324)
-    ax.set_title('Mic Raw Signal FFT')
-    plt.plot(np.fft.rfftfreq(len(out1), d=1/fs), np.fft.rfft(out1/(2**12) * 3.3))
-    plt.xlabel('Frequency (Hz)')
-    plt.ylabel('Power')
-    ax = plt.subplot(325)
-    ax.set_title('System')
-    plt.plot(np.array(range(len(sys1))) / fs, np.abs(sys1))
-    plt.xlabel('Lag (s)')
-    plt.ylabel('Response')
-    ax = plt.subplot(326)
-    ax.set_title('System FFT')
-    plt.loglog(np.fft.rfftfreq(len(sys1), d=1/fs), abs(np.fft.rfft(sys1)))
-    plt.xlabel('Frequency (Hz)')
-    plt.ylabel('Gain')
-    plt.tight_layout()
-    if not args['save_output'] == '':
-        plt.savefig('./data/%s/%s - 1.png' % (args['save_output'], args['save_output']), dpi=600, format='png')
-    
-    # Figure 2 is an input/output correlation plot
-    plt.figure(2)
-    plt.plot((np.array(range(len(sig) * 2 - 1))-(len(sig))) / fs, np.correlate(out1, sig, 'full'))
-    plt.xlabel('Lag (s)')
-    plt.ylabel('Power')
-    plt.title('Input-Output Cross Correlation')
-    plt.tight_layout()
-    if not args['save_output'] == '':
-        plt.savefig('./data/%s/%s - 2.png' % (args['save_output'], args['save_output']), dpi=600, format='png')
+    ####################################
+    # Classify the system as a gesture #
+    ####################################
+    classify_system(sys1)
 
-    # Figure 3 is an input/output correlation plot
-    plt.figure(3)
-    plt.plot((np.array(range(len(sig) * 2 - 1))-(len(sig))) / fs, np.correlate(out1, np.concatenate((np.diff(sig), np.array([0]))), 'full'))
-    plt.xlabel('Lag (s)')
-    plt.ylabel('Power')
-    plt.title('Input-Output Cross Correlation')
-    plt.tight_layout()
-    if not args['save_output'] == '':
-        plt.savefig('./data/%s/%s - 3.png' % (args['save_output'], args['save_output']), dpi=600, format='png')
-    plt.xlim(0, 0.004)
-    if not args['save_output'] == '':
-        plt.savefig('./data/%s/%s - 4.png' % (args['save_output'], args['save_output']), dpi=600, format='png')
+    return (times, sig, out1, sys1, out2, sys2)
 
-    # Show all of our plots
-    plt.show()
+## The main function
+if __name__ == "__main__":
+
+    # Process the command line arguments
+    args = process_args()
+
+    if args['realtime']:
+        fig, l = plot(*run_system(args))
+        print(l)
+        plt.show(block=False)
+        while(1):
+            update_plot(*run_system(args), fig, *l)
+    else:
+        plot(*run_system(args))
+        plt.show()
+
     
