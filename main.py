@@ -1,6 +1,9 @@
 import serial
 from scipy.signal import butter, lfilter, hilbert
 from scipy.linalg import toeplitz, solve_toeplitz
+from scipy.integrate import odeint
+from scipy.optimize import minimize
+from scipy.interpolate import interp1d
 import random
 import time
 import numpy as np
@@ -38,7 +41,7 @@ debug:                print lots of things to help debug this script
 
 # Process the command line arguments and return an args dictionary
 def process_args():
-    args = {'length': 8192,
+    args = {'length': 32768,
             'padding': 200,
             'signal_input': '',
             'signal_type': '',
@@ -147,36 +150,13 @@ def butter_lowpass_filter(data, cutoff, fs, order=5):
 
 # Generate a binary stochastic signal of the length `length`
 def generate_stochastic_signal(length):
-    random_signal = np.array(np.random.normal(0, 1, length - (2 * padding)))
-    signal  = random_signal - np.mean(random_signal)
-    signal[signal <= 0] = -1
-    signal[signal > 0] = 1
-    padding = np.array([0 for x in range(padding)])
-    signal = np.concatenate((padding, signal, padding))
-    return signal
-
-# Generate a binary stochastic signal of the length `length`
-def generate_simple_stochastic_signal(length):
     signal = np.resize([1, 0], length)
     for i in range(1, length):
-        if random.random() > 0.9:
+        if random.random() > 0.99:
             signal[i] = -1 * signal[i-1]
         else:
             signal[i] = signal[i-1]
     return signal.tolist()
-
-# Generate a square signal of the length `length` padded with `padding` zeros
-def generate_square_signal(length, padding):
-    signal  = np.resize([1,1,1,1, -1,-1,-1,-1], length - (2 * padding))
-    padding = np.resize([0], padding)
-    signal = np.concatenate((padding, signal, padding))
-    return signal
-
-# Generate a sinusoid signal
-def generate_sinusoid_signal(length):
-    freq = 10000
-    signal = np.array([np.sin(x * 2 * np.pi / (140000 / freq)) for x in range(length)])
-    return signal
 
 # Generate a single square signal of the length `length` padded with `padding` zeros
 def generate_single_square_signal(length, padding):
@@ -191,58 +171,32 @@ def send_signal(ser, signal):
     s = np.array(signal) - np.mean(signal)
     s *= (255.0 / 2) / abs(s).max()
     s += (255.0 / 2)
+    s = np.clip(s, 0, 1)
     ser.write(bytes([int(x) for x in s]))
     ser.flush()
 
 # Read in a teensy datastring from serial `ser`
 def read_teensy(ser, length):
     num_bytes = 2
-    num_samplers = 3
+    num_samplers = 2
     raw_output = ser.read(length * num_bytes * num_samplers)
     output = [(raw_output[x] << 8) + raw_output[x+1] for x in range(0, len(raw_output), 2)]
-    times = np.array(output[:len(output)//3])
-    out1 = np.array(output[len(output)//3:2*(len(output)//3)])
+    times = np.array(output[:len(output)//2])
+    out1 = np.array(output[len(output)//2:])
     out1 = out1 - np.mean(out1)
-    out2 = np.array(output[-(len(output)//3):])
-    out2 = out2 - np.mean(out2)
+    out2 = np.copy(out1)
     return (times.tolist(), out1.tolist(), out2.tolist())
-
-def moving_abs_average(data, span):
-    d = np.array(abs(data))
-    for i in range(span, len(data) - span):
-        d[i] = np.sum(data[i-span : i + span+1])
-    return d
 
 # Discover the system from an input `i` and output `o` using a traditional FFT method
 def discover_system(i, o):
     padding = np.resize([0], len(i))
     i_padded = np.concatenate((i, padding))
-    if not np.all(np.isfinite(i_padded)):
-        print('i_padded not finite')
-        print(i_padded.tolist())
     o_padded = np.concatenate((o, padding))
-    if not np.all(np.isfinite(o_padded)):
-        print('o_padded not finite')
-        print(o_padded.tolist())
     i_fft = np.fft.fft(i_padded)
-    if not np.all(np.isfinite(i_fft)):
-        print('i_fft not finite')
-        print(i_fft.tolist())
     np.place(i_fft, i_fft == 0, [.01])
     o_fft = np.fft.fft(o_padded)
-    if not np.all(np.isfinite(o_fft)):
-        print('o_fft not finite')
-        print(o_fft.tolist())
     ffts = np.divide(o_fft, i_fft)
-    if not np.all(np.isfinite(ffts)):
-        print('ffts not finite with val')
-        print(np.extract(np.invert(np.isfinite(ffts)), i_fft))
-        print('at freq')
-        print(np.extract(np.invert(np.isfinite(ffts)), np.fft.rfftfreq(len(o_padded), d=1/130000)))
-    sys = np.fft.irfft(ffts)
-    if not np.all(np.isfinite(sys)):
-        print('sys not finite')
-        #print(ffts.tolist())
+    sys = np.fft.ifft(ffts)
     return sys
 
 # Discover the system from an input `i` and output `o` using a toeplitz form
@@ -264,14 +218,123 @@ def discover_system_toeplitz(i, o, fs):
     sys = moving_abs_average(sys, 0)
     return sys
 
+# A model to fit our system
+def model(t, u):
+    u0 = u[0]
+    yp0 = data[0,2]
+    t = data[:,0].T - data[0,0]
+    u = data[:,1].T
+    yp = data[:,2].T
+    
+    # specify number of steps
+    ns = len(t)
+    delta_t = t[1]-t[0]
+    # create linear interpolation of the u data versus time
+    uf = interp1d(t,u)
+    
+    # define first-order plus dead-time approximation    
+    def fopdt(y,t,uf,Km,taum,thetam):
+        # arguments
+        #  y      = output
+        #  t      = time
+        #  uf     = input linear function (for time shift)
+        #  Km     = model gain
+        #  taum   = model time constant
+        #  thetam = model time constant
+        #  time-shift u
+        try:
+            if (t-thetam) <= 0:
+                um = uf(0.0)
+            else:
+                um = uf(t-thetam)
+        except:
+            #print('Error with time extrapolation: ' + str(t))
+            um = u0
+        # calculate derivative
+        dydt = (-(y-yp0) + Km * (um-u0))/taum
+        return dydt
+    
+    # simulate FOPDT model with x=[Km,taum,thetam]
+    def sim_model(x):
+        # input arguments
+        Km = x[0]
+        taum = x[1]
+        thetam = x[2]
+        # storage for model values
+        ym = np.zeros(ns)  # model
+        # initial condition
+        ym[0] = 0
+        # loop through time steps    
+        for i in range(ns-1):
+            ts = [t[i],t[i+1]]
+            y1 = odeint(fopdt,ym[i],ts,args=(uf,Km,taum,thetam))
+            ym[i+1] = y1[-1]
+        return ym
+    
+    # define objective
+    def objective(x):
+        # simulate model
+        ym = sim_model(x)
+        # calculate objective
+        obj = 0.0
+        for i in range(len(ym)):
+            obj = obj + (ym[i]-yp[i])**2    
+        # return result
+        return obj
+    
+    # initial guesses
+    x0 = np.zeros(3)
+    x0[0] = 2.0 # Km
+    x0[1] = 3.0 # taum
+    x0[2] = 0.0 # thetam
+    
+    # show initial objective
+    print('Initial SSE Objective: ' + str(objective(x0)))
+    
+    # optimize Km, taum, thetam
+    solution = minimize(objective,x0)
+    
+    # Another way to solve: with bounds on variables
+    #bnds = ((0.4, 0.6), (1.0, 10.0), (0.0, 30.0))
+    #solution = minimize(objective,x0,bounds=bnds,method='SLSQP')
+    x = solution.x
+    
+    # show final objective
+    print('Final SSE Objective: ' + str(objective(x)))
+    
+    print('Kp: ' + str(x[0]))
+    print('taup: ' + str(x[1]))
+    print('thetap: ' + str(x[2]))
+    
+    # calculate model with updated parameters
+    ym1 = sim_model(x0)
+    ym2 = sim_model(x)
+    # plot results
+    plt.figure()
+    plt.subplot(2,1,1)
+    plt.plot(t,yp,'kx-',linewidth=2,label='Process Data')
+    plt.plot(t,ym1,'b-',linewidth=2,label='Initial Guess')
+    plt.plot(t,ym2,'r--',linewidth=3,label='Optimized FOPDT')
+    plt.ylabel('Output')
+    plt.legend(loc='best')
+    plt.subplot(2,1,2)
+    plt.plot(t,u,'bx-',linewidth=2)
+    plt.plot(t,uf(t),'r--',linewidth=3)
+    plt.legend(['Measured','Interpolated'],loc='best')
+    plt.ylabel('Input Data')
+    plt.show()
+
+# fit the system to our model
+def fit_system(sys):
+    pass
+
 # Classify the identified systems as a gesture state
 def classify_system(s1):
     pass
 
+# Update the plots for the realtime viewer.
 def update_plot(times, sig, out1, sys1, out2, sys2, fig, l0, l1, l2, l3, l4, l5):
-    ###############
-    # Plot things #
-    ###############
+
     fs = 1000000 / (np.mean(np.diff(times)))
     # figure 1 shows how to discover the system for mic 1
     l0.set_xdata(times/1000000)
@@ -333,7 +396,7 @@ def plot(times, sig, out1, sys1, out2, sys2):
     plt.ylabel('Power')
     ax = plt.subplot(323)
     ax.set_title('Mic Raw Signal')
-    l2, = plt.plot(times / 1000000, (out1/(2**12) * 3.3))
+    l2, = plt.plot(times / 1000000, (out1/(2**12) * 3.3), 'k.')
     plt.xlabel('Time (s)')
     plt.ylabel('Voltage')
     plt.ylim(-2, 2)
@@ -354,8 +417,8 @@ def plot(times, sig, out1, sys1, out2, sys2):
     l5, = plt.loglog(np.fft.rfftfreq(len(sys1), d=1/fs), abs(np.fft.rfft(sys1)))
     plt.xlabel('Frequency (Hz)')
     plt.ylabel('Gain')
-    plt.xlim(500, 130000)
-    plt.ylim(10, 100000)
+    #plt.xlim(500, 130000)
+    #plt.ylim(10, 100000)
     plt.tight_layout()
     fig.canvas.draw()
     if not args['save_output'] == '':
@@ -397,7 +460,7 @@ def run_system(args):
         # If we pass in a signal file...
         if not args['signal_input'] == '':
             # Open that signal file...
-            filename = './data/%s/%s.datafile' % (args['use_datafile'], args['use_datafile'])
+            filename = './data/%s/%s.datafile' % (args['signal_input'], args['signal_input'])
             with open(filename) as f:
                 # And load that to memory...
                 data = json.load(f)
@@ -405,26 +468,14 @@ def run_system(args):
         # Otherwise...
         else:
             sig = []
-            if args['signal_type'] == 'square':
-                # Generate a square signal
-                sig = generate_square_signal(args['length'], args['padding'])
-            elif args['signal_type'] == 'single_square':
-                # Generate a square signal
-                sig = generate_single_square_signal(args['length'], args['padding'])
-            elif args['signal_type'] == 'stochastic':
-                # Generate a new binary stochastic signal
-                sig = generate_stochastic_signal(args['length'])
-            elif args['signal_type'] == 'simple_stochastic':
+            if args['signal_type'] == 'stochastic':
                 # Generate a new binary stochastic signal
                 for i in range(num_repeats):
-                    sig.append(generate_simple_stochastic_signal(args['length']))
-            elif args['signal_type'] == 'sinusoid':
-                # Generate a new sinusoid
-                sig = generate_sinusoid_signal(args['length'])
+                    sig.append(generate_stochastic_signal(args['length']))
             else:
-                print('Signal type not specified, defaulting to simple stochastic')
+                print('Signal type not specified, defaulting to stochastic')
                 for i in range(num_repeats):
-                    sig.append(generate_simple_stochastic_signal(args['length']))
+                    sig.append(generate_stochastic_signal(args['length']))
 
     #####################
     # Get a data stream #
@@ -451,7 +502,7 @@ def run_system(args):
             for i in range(num_repeats):
                 send_signal(ser, sig[i])
                 # Read the output from the teensy...
-                t, o1, o2 = read_teensy(ser, args['length'])
+                t, o1, o2 = read_teensy(ser, len(sig[i]))
                 times.append(t)
                 out1.append(o1)
                 out2.append(o2)
@@ -485,7 +536,7 @@ def run_system(args):
 
         if args['filter_mic'] == True:
             s  = np.concatenate(([0], np.abs(np.diff(s))))
-            o1 = butter_lowpass_filter(o1, 50000, fs)
+            o1 = butter_bandpass_filter(o1, 30000, 50000, fs)
             o2 = butter_bandpass_filter(o2, 30000, 50000, fs)
         
         if args['use_toeplitz'] == True:
@@ -498,8 +549,8 @@ def run_system(args):
     sig = np.array(sig[0])
     out1 = np.array(o1)
     out2 = np.array(o2)
-    sys1 = np.mean(sys1, axis=0)
-    sys2 = np.array(sys1)
+    sys1 = np.real(np.mean(sys1, axis=0))
+    sys2 = np.copy(sys1)
     
     #################
     # Save the Data #
@@ -508,10 +559,10 @@ def run_system(args):
         filename = './data/%s/%s.datafile' % (args['save_output'], args['save_output'])
         ensure_dir(filename)
         with open(filename, 'w') as f:
-            json.dump({'sig': sig.tolist(),
-                       'times': times.tolist(),
-                       'out1': out1.tolist(),
-                       'out2': out2.tolist(),
+            json.dump({'sig': [sig.tolist()],
+                       'times': [times.tolist()],
+                       'out1': [out1.tolist()],
+                       'out2': [out2.tolist()],
                        'sys1': sys1.tolist(),
                        'sys2': sys2.tolist()}, f)
             print('Saved data to: ', filename)
